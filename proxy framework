@@ -1,0 +1,486 @@
+//SSL Communication
+//Decrypting and Storing Data:
+//Caching Data in output file
+//Encrypting and Forwarding Data to the Client
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <time.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <ctype.h>    // Added: For isalnum()
+#include <dirent.h>   // Added: For directory operations
+#include <limits.h>   // Added: For PATH_MAX
+
+#define BUFFER_SIZE 8192
+#define DEFAULT_PORT 8888
+#define MAX_PATH_LENGTH 1024
+#define MAX_CACHE_ENTRIES 1000
+#define CACHE_EXPIRE_TIME 3600  // 1 hour
+
+// Cache structure definition
+typedef struct {
+    char *host;
+    char *data;
+    size_t length;
+    time_t timestamp;
+    pthread_mutex_t mutex;
+} CacheEntry;
+
+// SSL proxy context structure definition
+typedef struct {
+    SSL_CTX *server_ctx;  // SSL context for communication with client
+    SSL_CTX *client_ctx;  // SSL context for communication with server
+    CacheEntry cache[MAX_CACHE_ENTRIES];  // Cache array
+    int cache_count;  // Current cache entry count
+    pthread_mutex_t cache_mutex;  // Cache mutex
+} SSL_PROXY_CTX;
+
+// Function declarations
+int connect_to_server(const char *host, int port);
+SSL_PROXY_CTX* init_ssl_proxy(void);
+void store_decrypted_data(SSL_PROXY_CTX *ctx, const char *data, size_t length, const char *host);
+CacheEntry* get_cached_data(SSL_PROXY_CTX *ctx, const char *host);
+void cleanup_cache(SSL_PROXY_CTX *ctx);
+
+// Initialize SSL proxy
+SSL_PROXY_CTX* init_ssl_proxy(void) {
+    SSL_PROXY_CTX *ctx = malloc(sizeof(SSL_PROXY_CTX));
+    if (!ctx) {
+        return NULL;
+    }
+    
+    // Initialize SSL library
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+    
+    // Create server SSL context
+    ctx->server_ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx->server_ctx) {
+        fprintf(stderr, "Failed to create server SSL context\n");
+        free(ctx);
+        return NULL;
+    }
+    
+    // Load server certificate and private key
+    if (SSL_CTX_use_certificate_file(ctx->server_ctx, "server.crt", SSL_FILETYPE_PEM) <= 0) {
+        fprintf(stderr, "Failed to load server certificate\n");
+        SSL_CTX_free(ctx->server_ctx);
+        free(ctx);
+        return NULL;
+    }
+    
+    if (SSL_CTX_use_PrivateKey_file(ctx->server_ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
+        fprintf(stderr, "Failed to load server private key\n");
+        SSL_CTX_free(ctx->server_ctx);
+        free(ctx);
+        return NULL;
+    }
+    
+    // Create client SSL context
+    ctx->client_ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx->client_ctx) {
+        fprintf(stderr, "Failed to create client SSL context\n");
+        SSL_CTX_free(ctx->server_ctx);
+        free(ctx);
+        return NULL;
+    }
+
+    // Change: Create output directory instead of cache directory
+    struct stat st = {0};
+    if (stat("output", &st) == -1) {
+        #ifdef _WIN32
+            mkdir("output");
+        #else
+            mkdir("output", 0755);
+        #endif
+    }
+
+    // Initialize cache
+    ctx->cache_count = 0;
+    pthread_mutex_init(&ctx->cache_mutex, NULL);
+    for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
+        ctx->cache[i].host = NULL;
+        ctx->cache[i].data = NULL;
+        ctx->cache[i].length = 0;
+        pthread_mutex_init(&ctx->cache[i].mutex, NULL);
+    }
+    
+    return ctx;
+}
+
+// Store decrypted data
+void store_decrypted_data(SSL_PROXY_CTX *ctx, const char *data, size_t length, const char *host) {
+    pthread_mutex_lock(&ctx->cache_mutex);
+    
+    // Find existing cache entry or create a new one
+    int index = -1;
+    for (int i = 0; i < ctx->cache_count; i++) {
+        if (ctx->cache[i].host && strcmp(ctx->cache[i].host, host) == 0) {
+            index = i;
+            break;
+        }
+    }
+    
+    if (index == -1 && ctx->cache_count < MAX_CACHE_ENTRIES) {
+        index = ctx->cache_count++;
+    } else if (index == -1) {
+        // If cache is full, replace the oldest entry
+        time_t oldest_time = time(NULL);
+        int oldest_index = 0;
+        for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
+            if (ctx->cache[i].timestamp < oldest_time) {
+                oldest_time = ctx->cache[i].timestamp;
+                oldest_index = i;
+            }
+        }
+        index = oldest_index;
+        
+        // Clean up the old entry
+        free(ctx->cache[index].host);
+        free(ctx->cache[index].data);
+    }
+    
+    // Update cache entry
+    pthread_mutex_lock(&ctx->cache[index].mutex);
+    
+    ctx->cache[index].host = strdup(host);
+    ctx->cache[index].data = malloc(length);
+    memcpy(ctx->cache[index].data, data, length);
+    ctx->cache[index].length = length;
+    ctx->cache[index].timestamp = time(NULL);
+    
+    // Change: Create timestamped filename
+    char filename[MAX_PATH_LENGTH];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char timestamp[20];
+    strftime(timestamp, 20, "%Y%m%d_%H%M%S", tm_info);
+    
+    // Clean special characters from hostname
+    char safe_host[256] = {0};
+    int j = 0;
+    for(int i = 0; host[i] && j < 255; i++) {
+        if(isalnum(host[i]) || host[i] == '.' || host[i] == '-' || host[i] == '_') {
+            safe_host[j++] = host[i];
+        }
+    }
+    safe_host[j] = '\0';
+    
+    // Change: Construct new filename format
+    snprintf(filename, sizeof(filename), "output/%s_%s.dat", timestamp, safe_host);
+    
+    // Create file and write data
+    FILE *fp = fopen(filename, "wb");
+    if (fp) {
+        // Add header information
+        fprintf(fp, "Host: %s\nTimestamp: %s\nContent-Length: %zu\n\n", 
+                host, timestamp, length);
+        
+        // Write actual content
+        fwrite(data, 1, length, fp);
+        fclose(fp);
+        
+        printf("Stored data for %s in file: %s\n", host, filename);
+    } else {
+        fprintf(stderr, "Failed to create output file: %s\n", filename);
+    }
+    
+    pthread_mutex_unlock(&ctx->cache[index].mutex);
+    pthread_mutex_unlock(&ctx->cache_mutex);
+}
+
+// Retrieve cached data
+CacheEntry* get_cached_data(SSL_PROXY_CTX *ctx, const char *host) {
+    pthread_mutex_lock(&ctx->cache_mutex);
+    
+    for (int i = 0; i < ctx->cache_count; i++) {
+        if (ctx->cache[i].host && strcmp(ctx->cache[i].host, host) == 0) {
+            time_t now = time(NULL);
+            if (now - ctx->cache[i].timestamp <= CACHE_EXPIRE_TIME) {
+                pthread_mutex_lock(&ctx->cache[i].mutex);
+                pthread_mutex_unlock(&ctx->cache_mutex);
+                return &ctx->cache[i];
+            }
+            break;
+        }
+    }
+    
+    pthread_mutex_unlock(&ctx->cache_mutex);
+    return NULL;
+}
+
+// Handle HTTPS connection
+void handle_https_connection(SSL_PROXY_CTX *proxy_ctx, int client_fd, 
+                           const char *host, int port) {
+    int server_fd;
+    SSL *client_ssl = NULL, *server_ssl = NULL;
+    char buffer[BUFFER_SIZE];
+    int bytes_read;
+    
+    // Check cache
+    CacheEntry *cached = get_cached_data(proxy_ctx, host);
+    if (cached) {
+        // If cached data exists, send it directly
+        client_ssl = SSL_new(proxy_ctx->server_ctx);
+        if (!client_ssl) {
+            fprintf(stderr, "Failed to create client SSL structure\n");
+            if (cached) pthread_mutex_unlock(&cached->mutex);
+            return;
+        }
+        
+        SSL_set_fd(client_ssl, client_fd);
+        if (SSL_accept(client_ssl) <= 0) {
+            fprintf(stderr, "SSL accept failed\n");
+            SSL_free(client_ssl);
+            if (cached) pthread_mutex_unlock(&cached->mutex);
+            return;
+        }
+        
+        SSL_write(client_ssl, cached->data, cached->length);
+        pthread_mutex_unlock(&cached->mutex);
+        SSL_shutdown(client_ssl);
+        SSL_free(client_ssl);
+        return;
+    }
+
+    // If no cache, establish connection to target server
+    server_fd = connect_to_server(host, port);
+    if (server_fd < 0) {
+        return;
+    }
+
+    // Set up SSL connection
+    client_ssl = SSL_new(proxy_ctx->server_ctx);
+    server_ssl = SSL_new(proxy_ctx->client_ctx);
+    
+    if (!client_ssl || !server_ssl) {
+        fprintf(stderr, "Failed to create SSL structures\n");
+        goto cleanup;
+    }
+
+    SSL_set_fd(client_ssl, client_fd);
+    SSL_set_fd(server_ssl, server_fd);
+
+    if (SSL_accept(client_ssl) <= 0) {
+        fprintf(stderr, "SSL accept failed\n");
+        goto cleanup;
+    }
+
+    if (SSL_connect(server_ssl) <= 0) {
+        fprintf(stderr, "SSL connect failed\n");
+        goto cleanup;
+    }
+
+    // Data forwarding loop
+    char *temp_buffer = NULL;
+    size_t total_length = 0;
+    
+    while (1) {
+        // Read request from client
+        bytes_read = SSL_read(client_ssl, buffer, sizeof(buffer));
+        if (bytes_read <= 0) break;
+
+        // Forward request to server
+        if (SSL_write(server_ssl, buffer, bytes_read) <= 0) break;
+
+        // Read response from server
+        bytes_read = SSL_read(server_ssl, buffer, sizeof(buffer));
+        if (bytes_read <= 0) break;
+
+        // Store decrypted data
+        char *new_temp = realloc(temp_buffer, total_length + bytes_read);
+        if (new_temp) {
+            temp_buffer = new_temp;
+            memcpy(temp_buffer + total_length, buffer, bytes_read);
+            total_length += bytes_read;
+        }
+
+        // Send response to client
+        if (SSL_write(client_ssl, buffer, bytes_read) <= 0) break;
+    }
+
+    // If the complete response was successfully collected, store in cache
+    if (temp_buffer && total_length > 0) {
+        store_decrypted_data(proxy_ctx, temp_buffer, total_length, host);
+        free(temp_buffer);
+    }
+
+cleanup:
+    if (client_ssl) {
+        SSL_shutdown(client_ssl);
+        SSL_free(client_ssl);
+    }
+    if (server_ssl) {
+        SSL_shutdown(server_ssl);
+        SSL_free(server_ssl);
+    }
+    close(server_fd);
+}
+
+// Clean up cache
+void cleanup_output_directory(const char *dir_path, int max_age_hours) {
+    DIR *dir;
+    struct dirent *ent;
+    time_t now = time(NULL);
+    char full_path[MAX_PATH_LENGTH];
+    
+    dir = opendir(dir_path);
+    if (dir != NULL) {
+        while ((ent = readdir(dir)) != NULL) {
+            if (ent->d_type == DT_REG) { // Only process regular files
+                snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->d_name);
+                
+                struct stat st;
+                if (stat(full_path, &st) == 0) {
+                    // Check file age
+                    if (difftime(now, st.st_mtime) > (max_age_hours * 3600)) {
+                        if (remove(full_path) == 0) {
+                            printf("Removed old file: %s\n", ent->d_name);
+                        }
+                    }
+                }
+            }
+        }
+        closedir(dir);
+    }
+}
+
+int connect_to_server(const char *host, int port) {
+    struct hostent *he;
+    struct sockaddr_in server_addr;
+    int sockfd;
+
+    // DNS lookup to get IP address
+    if ((he = gethostbyname(host)) == NULL) {
+        herror("gethostbyname failed");
+        return -1;
+    }
+
+    // Create socket
+    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("socket creation failed");
+        return -1;
+    }
+
+    // Set up server address structure
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    memcpy(&server_addr.sin_addr, he->h_addr, he->h_length);
+
+    // Connect to server
+    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect failed");
+        close(sockfd);
+        return -1;
+    }
+
+    // Set socket options
+    struct timeval timeout;
+    timeout.tv_sec = 10;  // 10 seconds timeout
+    timeout.tv_usec = 0;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt failed");
+    }
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt failed");
+    }
+
+    return sockfd;
+}
+
+int main(void) {
+    int server_fd, client_fd;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    SSL_PROXY_CTX *proxy_ctx;
+
+    // Initialize SSL proxy context
+    proxy_ctx = init_ssl_proxy();
+    if (!proxy_ctx) {
+        fprintf(stderr, "Failed to initialize SSL proxy\n");
+        return 1;
+    }
+
+    // Create server socket
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("Failed to create socket");
+        return 1;
+    }
+
+    // Set socket options
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // Bind address
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(DEFAULT_PORT);
+
+    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        return 1;
+    }
+
+    // Listen for connections
+    if (listen(server_fd, 5) < 0) {
+        perror("Listen failed");
+        return 1;
+    }
+
+    printf("Proxy server started on port %d\n", DEFAULT_PORT);
+
+    // Main loop
+    while (1) {
+        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) {
+            perror("Accept failed");
+            continue;
+        }
+
+        // Handle CONNECT request
+        char buffer[BUFFER_SIZE];
+        int bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+        if (bytes > 0) {
+            buffer[bytes] = '\0';
+            
+            char host[256];
+            int port;
+            if (sscanf(buffer, "CONNECT %255[^:]:%d", host, &port) == 2) {
+                const char *response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+                send(client_fd, response, strlen(response), 0);
+                
+                handle_https_connection(proxy_ctx, client_fd, host, port);
+            }
+        }
+        close(client_fd);
+    }
+
+    // Clean up
+    close(server_fd);
+    if (proxy_ctx) {
+        if (proxy_ctx->server_ctx) SSL_CTX_free(proxy_ctx->server_ctx);
+        if (proxy_ctx->client_ctx) SSL_CTX_free(proxy_ctx->client_ctx);
+        free(proxy_ctx);
+    }
+    EVP_cleanup();
+
+    return 0;
+}
