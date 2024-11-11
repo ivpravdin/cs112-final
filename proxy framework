@@ -1,3 +1,4 @@
+//Select for multiclient
 //SSL Communication
 //Decrypting and Storing Data:
 //Caching Data in output file
@@ -22,12 +23,15 @@
 #include <ctype.h>    // Added: For isalnum()
 #include <dirent.h>   // Added: For directory operations
 #include <limits.h>   // Added: For PATH_MAX
+#include <sys/select.h>
+#include <fcntl.h> 
 
 #define BUFFER_SIZE 8192
 #define DEFAULT_PORT 8888
 #define MAX_PATH_LENGTH 1024
 #define MAX_CACHE_ENTRIES 1000
 #define CACHE_EXPIRE_TIME 3600  // 1 hour
+#define MAX_CLIENTS 1024
 
 // Cache structure definition
 typedef struct {
@@ -37,6 +41,13 @@ typedef struct {
     time_t timestamp;
     pthread_mutex_t mutex;
 } CacheEntry;
+
+typedef struct {
+    int fd;
+    char buffer[BUFFER_SIZE];
+    size_t buffer_used;
+    int connect_handled;
+} ClientConnection;
 
 // SSL proxy context structure definition
 typedef struct {
@@ -405,15 +416,25 @@ int connect_to_server(const char *host, int port) {
 }
 
 int main(void) {
-    int server_fd, client_fd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    int server_fd;
+    struct sockaddr_in server_addr;
     SSL_PROXY_CTX *proxy_ctx;
+    fd_set read_fds, master_fds;
+    int max_fd;
+    ClientConnection *clients;
+    
+    // Initialize client tracking array
+    clients = calloc(MAX_CLIENTS, sizeof(ClientConnection));
+    if (!clients) {
+        fprintf(stderr, "Failed to allocate client array\n");
+        return 1;
+    }
 
     // Initialize SSL proxy context
     proxy_ctx = init_ssl_proxy();
     if (!proxy_ctx) {
         fprintf(stderr, "Failed to initialize SSL proxy\n");
+        free(clients);
         return 1;
     }
 
@@ -421,12 +442,17 @@ int main(void) {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("Failed to create socket");
+        free(clients);
         return 1;
     }
 
     // Set socket options
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // Set non-blocking mode for server socket
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
 
     // Bind address
     memset(&server_addr, 0, sizeof(server_addr));
@@ -436,45 +462,135 @@ int main(void) {
 
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("Bind failed");
+        free(clients);
         return 1;
     }
 
     // Listen for connections
     if (listen(server_fd, 5) < 0) {
         perror("Listen failed");
+        free(clients);
         return 1;
     }
 
     printf("Proxy server started on port %d\n", DEFAULT_PORT);
 
+    // Initialize fd sets
+    FD_ZERO(&master_fds);
+    FD_SET(server_fd, &master_fds);
+    max_fd = server_fd;
+
     // Main loop
     while (1) {
-        client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd < 0) {
-            perror("Accept failed");
+        read_fds = master_fds;
+        
+        if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) == -1) {
+            perror("Select failed");
             continue;
         }
 
-        // Handle CONNECT request
-        char buffer[BUFFER_SIZE];
-        int bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-        if (bytes > 0) {
-            buffer[bytes] = '\0';
+        // Check for new connections
+        if (FD_ISSET(server_fd, &read_fds)) {
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
             
-            char host[256];
-            int port;
-            if (sscanf(buffer, "CONNECT %255[^:]:%d", host, &port) == 2) {
-                const char *response = "HTTP/1.1 200 Connection Established\r\n\r\n";
-                send(client_fd, response, strlen(response), 0);
-                
-                handle_https_connection(proxy_ctx, client_fd, host, port);
+            if (client_fd < 0) {
+                perror("Accept failed");
+                continue;
+            }
+
+            // Set non-blocking mode for client socket
+            flags = fcntl(client_fd, F_GETFL, 0);
+            fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+            // Add to client tracking array
+            int i;
+            for (i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].fd == 0) {
+                    clients[i].fd = client_fd;
+                    clients[i].buffer_used = 0;
+                    clients[i].connect_handled = 0;
+                    break;
+                }
+            }
+
+            if (i == MAX_CLIENTS) {
+                fprintf(stderr, "Too many clients\n");
+                close(client_fd);
+                continue;
+            }
+
+            FD_SET(client_fd, &master_fds);
+            if (client_fd > max_fd) {
+                max_fd = client_fd;
+            }
+
+            printf("New connection from %s:%d\n", 
+                   inet_ntoa(client_addr.sin_addr), 
+                   ntohs(client_addr.sin_port));
+            continue;
+        }
+
+        // Check existing clients
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].fd > 0 && FD_ISSET(clients[i].fd, &read_fds)) {
+                if (!clients[i].connect_handled) {
+                    // Handle CONNECT request
+                    ssize_t bytes = recv(clients[i].fd, 
+                                       clients[i].buffer + clients[i].buffer_used,
+                                       BUFFER_SIZE - clients[i].buffer_used - 1, 
+                                       0);
+
+                    if (bytes <= 0) {
+                        if (bytes < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                            continue;
+                        }
+                        // Connection closed or error
+                        close(clients[i].fd);
+                        FD_CLR(clients[i].fd, &master_fds);
+                        clients[i].fd = 0;
+                        continue;
+                    }
+
+                    clients[i].buffer_used += bytes;
+                    clients[i].buffer[clients[i].buffer_used] = '\0';
+
+                    // Check if we have a complete CONNECT request
+                    if (strstr(clients[i].buffer, "\r\n\r\n")) {
+                        char host[256];
+                        int port;
+                        if (sscanf(clients[i].buffer, "CONNECT %255[^:]:%d", host, &port) == 2) {
+                            const char *response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+                            send(clients[i].fd, response, strlen(response), 0);
+                            
+                            // Set socket back to blocking mode for SSL
+                            flags = fcntl(clients[i].fd, F_GETFL, 0);
+                            fcntl(clients[i].fd, F_SETFL, flags & ~O_NONBLOCK);
+                            
+                            // Handle HTTPS connection in blocking mode
+                            handle_https_connection(proxy_ctx, clients[i].fd, host, port);
+                            
+                            // Clean up after HTTPS handling
+                            close(clients[i].fd);
+                            FD_CLR(clients[i].fd, &master_fds);
+                            clients[i].fd = 0;
+                        }
+                    }
+                }
             }
         }
-        close(client_fd);
     }
 
-    // Clean up
+    // Cleanup
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd > 0) {
+            close(clients[i].fd);
+        }
+    }
     close(server_fd);
+    free(clients);
+    
     if (proxy_ctx) {
         if (proxy_ctx->server_ctx) SSL_CTX_free(proxy_ctx->server_ctx);
         if (proxy_ctx->client_ctx) SSL_CTX_free(proxy_ctx->client_ctx);
