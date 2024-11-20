@@ -9,7 +9,10 @@
 #include <time.h>
 #include <stdio.h> // remove later
 #include <unistd.h>
-#include "assert.h"
+#include <sys/ioctl.h>
+#include <assert.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "connection_list.h"
 
@@ -148,7 +151,13 @@ int get_max_fd(connection_list cl)
 int read_from_connection(connection c, char *buffer, int length)
 {
     if (c->using_ssl) {
-        return SSL_read(c->ssl, buffer, length);
+        int bytes_read = 0;
+        bytes_read = SSL_read(c->ssl, buffer, length);
+        if (bytes_read <= 0) {
+            printf("Error reading from SSL connection\n");
+            ERR_print_errors_fp(stdout);
+        }
+        return bytes_read;
     } else {
         return read(c->fd, buffer, length);
     }

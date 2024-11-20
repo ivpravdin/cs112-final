@@ -1,10 +1,14 @@
 src = $(wildcard *.c)
 obj = $(src:.c=.o)
 CC = gcc
+CFLAGS = -g
 LDFLAGS = -lnsl -lssl -lcrypto
 
 a.out: $(obj)
-	$(CC) -g -Wall -Wextra -Werror -o $@ $^ $(LDFLAGS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 .PHONY: clean
 clean:

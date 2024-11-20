@@ -107,6 +107,7 @@ X509 *GenerateCertificate(char *hostname, X509 *issuer_cert, EVP_PKEY *issuer_ke
         return NULL;
     }
 
+    srand(time(NULL));
     if (!ASN1_INTEGER_set(serial, rand())) {
         ERR_print_errors_fp(stderr);
         ASN1_INTEGER_free(serial);

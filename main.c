@@ -18,7 +18,6 @@ void setup_signal_handler() {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN);
 }
 
 int main(int argc, char *argv[])
@@ -30,7 +29,8 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    setup_signal_handler();
+    //setup_signal_handler();
+    signal(SIGPIPE, SIG_IGN);
 
     global_proxy = proxy_init(atoi(argv[1]), argv[2], argv[3]);
     errno = proxy_run(global_proxy);
