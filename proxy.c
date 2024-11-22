@@ -9,6 +9,7 @@
 #include <openssl/err.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <ctype.h>
 
 #include "proxy.h"
 #include "connection_list.h"
@@ -31,9 +32,15 @@ typedef struct Proxy {
 
 Proxy proxy_init(int port, const char *ca_filename, const char *key_filename)
 {
+    int optval;
+         
     Proxy p = malloc(sizeof(struct Proxy));
     p->sockfd = socket(AF_INET, SOCK_STREAM, 0);
     p->cl = connection_list_init();
+
+    optval = 1;
+    setsockopt(p->sockfd, SOL_SOCKET, SO_REUSEADDR, 
+	     (const void *)&optval , sizeof(int));
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
@@ -144,6 +151,7 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
         SSL_set_tlsext_host_name(server_ssl, hostname);
         SSL_set_fd(server_ssl, c->peer->fd);
         SSL_set_options(server_ssl, SSL_OP_IGNORE_UNEXPECTED_EOF);
+        SSL_set_mode(server_ssl, SSL_MODE_ASYNC | SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
         while (-1 == SSL_connect(server_ssl))
         {
@@ -181,6 +189,7 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
         SSL *client_ssl = SSL_new(client_ctx);
         SSL_set_fd(client_ssl, c->fd);
         SSL_set_options(client_ssl, SSL_OP_IGNORE_UNEXPECTED_EOF);
+        SSL_set_mode(client_ssl, SSL_MODE_ASYNC | SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
         while (-1 == SSL_accept(client_ssl))
         {
@@ -257,6 +266,23 @@ static int process_message(Proxy p, connection c, char *buffer, int buffer_lengt
     char CONNECT_response[] = "HTTP/1.1 200 OK\r\n\r\n";
     get_method(buffer, method, 16);
 
+    char *accept_encoding = strcasestr(buffer, "Accept-Encoding:");
+    if (c->role == 0 && accept_encoding != NULL) {
+        char *end = strstr(accept_encoding, "\r\n");
+        if (end != NULL) {
+            memmove(accept_encoding, end + 2, buffer_length - (end + 2 - buffer));
+            buffer_length -= (end + 2 - accept_encoding);
+        }
+    }
+
+// for (int i = 0; i <= buffer_length - 3; i++) {
+//     if (strncmp(&buffer[i], "the", 3) == 0) {
+//         buffer[i] = 'l';
+//         buffer[i + 1] = 'o';
+//         buffer[i + 2] = 'l';
+//     }
+// }
+
     if (c->peer == NULL) {
         get_field(buffer, "Host: ", hostname_and_port, 256);
         sscanf(hostname_and_port, "%255[^:]:%15s", hostname, port);
@@ -269,15 +295,22 @@ static int process_message(Proxy p, connection c, char *buffer, int buffer_lengt
         }
 
         int serverfd = connect_to_server(hostname, port);
+        if (serverfd < 0) {
+            disconnect_connection(p, c);
+            return -1;
+        }
         connection server = init_connection();
         server->fd = serverfd;
         c->peer = server;
         server->peer = c;
+        server->role = 1;
         add_connection(p->cl, server);
 
         if (strcmp(method, "CONNECT") == 0){
             write_to_connection(c, CONNECT_response, strlen(CONNECT_response));
             init_SSL_connection(p, c, hostname);
+        } else {
+            write_to_connection(server, buffer, buffer_length);
         }
     } else {
         write_to_connection(c->peer, buffer, buffer_length);
