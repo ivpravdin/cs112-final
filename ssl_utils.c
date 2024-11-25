@@ -55,17 +55,11 @@ EVP_PKEY *LoadPrivateKey(const char *filename)
 }
 
 // Used when connecting to a client
-SSL_CTX *CreateSSLContext(X509 *cert, EVP_PKEY *key)
+SSL *CreateClientSSL(X509 *cert, EVP_PKEY *key, int sockfd)
 {
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (ctx == NULL) {
         ERR_print_errors_fp(stderr);
-        return NULL;
-    }
-
-    if(SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) <= 0) {
-        ERR_print_errors_fp(stderr);
-        SSL_CTX_free(ctx);
         return NULL;
     }
 
@@ -81,7 +75,80 @@ SSL_CTX *CreateSSLContext(X509 *cert, EVP_PKEY *key)
         return NULL;
     }
 
-    return ctx;
+    SSL *ssl = SSL_new(ctx);
+
+    if (SSL_set_fd(ssl, sockfd) == 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (SSL_set_options(ssl, SSL_OP_IGNORE_UNEXPECTED_EOF) == 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (SSL_set_mode(ssl, SSL_MODE_ASYNC) == 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    SSL_CTX_free(ctx);
+
+    return ssl;
+}
+
+SSL *CreateServerSSL(char *hostname, int sockfd)
+{
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx == NULL) {
+        ERR_print_errors_fp(stderr);
+        return NULL;
+    }
+
+    SSL *ssl = SSL_new(ctx);
+    if (ssl == NULL) {
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (SSL_set_tlsext_host_name(ssl, hostname) == 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (SSL_set_fd(ssl, sockfd) == 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (SSL_set_options(ssl, SSL_OP_IGNORE_UNEXPECTED_EOF) == 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (SSL_set_mode(ssl, SSL_MODE_ASYNC) == 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    SSL_CTX_free(ctx);
+
+    return ssl;
 }
 
 X509 *GenerateCertificate(char *hostname, X509 *issuer_cert, EVP_PKEY *issuer_key)
@@ -107,15 +174,31 @@ X509 *GenerateCertificate(char *hostname, X509 *issuer_cert, EVP_PKEY *issuer_ke
         return NULL;
     }
 
-    srand(time(NULL));
-    if (!ASN1_INTEGER_set(serial, rand())) {
+    unsigned char serial_bytes[20];
+    if (RAND_bytes(serial_bytes, sizeof(serial_bytes)) != 1) {
         ERR_print_errors_fp(stderr);
         ASN1_INTEGER_free(serial);
         X509_free(cert);
         return NULL;
     }
 
-    printf("Serial number: %ld\n", ASN1_INTEGER_get(serial));
+    BIGNUM *bn = BN_bin2bn(serial_bytes, sizeof(serial_bytes), NULL);
+    if (bn == NULL) {
+        ERR_print_errors_fp(stderr);
+        ASN1_INTEGER_free(serial);
+        X509_free(cert);
+        return NULL;
+    }
+
+    if (!BN_to_ASN1_INTEGER(bn, serial)) {
+        ERR_print_errors_fp(stderr);
+        BN_free(bn);
+        ASN1_INTEGER_free(serial);
+        X509_free(cert);
+        return NULL;
+    }
+
+    BN_free(bn);
     
     if (!X509_set_serialNumber(cert, serial)) {
         ERR_print_errors_fp(stderr);

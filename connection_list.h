@@ -25,8 +25,6 @@ struct connection {
     connection peer;                                 // The peer connection
     bool using_ssl;                                  // Whether the connection is using SSL
     SSL *ssl;                                        // SSL context for the connection
-    char *overflow_buffer;                           // Buffer for overflow data
-    int overflow_length;                             // Length of overflow data
     struct HTTPMessage message;                      // The HTTP message from the connection
 };
 

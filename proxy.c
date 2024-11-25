@@ -51,12 +51,13 @@ Proxy proxy_init(int port, const char *ca_filename, const char *key_filename)
         perror("Bind");
         exit(1);
     }
-    listen(p->sockfd, 5);
 
     InitializeSSL();
 
     p->ca = LoadCertificate(ca_filename);
     p->key = LoadPrivateKey(key_filename);
+
+    listen(p->sockfd, 5);
 
     DEBUG("Proxy initialized\n");
 
@@ -92,7 +93,7 @@ static void accept_new_client(Proxy p)
 
 static void disconnect_connection(Proxy p, connection c)
 {
-    if (c->peer != NULL) {
+    if (c != NULL && c->peer != NULL) {
         DEBUG("Connection closed %d\n", c->peer->fd);
         remove_connection(p->cl, c->peer);
         connection_free(c->peer);
@@ -142,22 +143,24 @@ static void ssl_error(Proxy p, connection c)
 
 static void init_SSL_connection(Proxy p, connection c, char *hostname)
 {
+    SSL *server_ssl, *client_ssl;
+
     if (c->using_ssl)
         return;
 
+    DEBUG("Initializing SSL connection\n");
+    printf("C-role: %d\n", c->role);
     if (c->role == 0) {
-        SSL_CTX *server_ctx = SSL_CTX_new(TLS_client_method());
-        SSL *server_ssl = SSL_new(server_ctx);
-        SSL_set_tlsext_host_name(server_ssl, hostname);
-        SSL_set_fd(server_ssl, c->peer->fd);
-        SSL_set_options(server_ssl, SSL_OP_IGNORE_UNEXPECTED_EOF);
-        SSL_set_mode(server_ssl, SSL_MODE_ASYNC | SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        server_ssl = CreateServerSSL(hostname, c->peer->fd);
 
         while (-1 == SSL_connect(server_ssl))
         {
             fd_set fds;
             FD_ZERO(&fds);
             FD_SET(c->peer->fd, &fds);
+
+            ERR_print_errors_fp(stdout);
+            printf("SSL_error: %d\n", SSL_get_error(server_ssl, -1));
 
             switch (SSL_get_error(server_ssl, -1))
             {
@@ -168,7 +171,7 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
                     select(c->peer->fd + 1, NULL, &fds, NULL, NULL);
                     break;
                 default:
-                    SSL_CTX_free(server_ctx);
+                    SSL_free(server_ssl);
                     ssl_error(p, c);
                     return;
             }
@@ -177,25 +180,17 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
         c->peer->ssl = server_ssl;
         c->peer->using_ssl = 1;
 
-        SSL_CTX_free(server_ctx);
-
-        DEBUG("SSL connection initialized for server\n");
-
-        // Client-side (client to proxy)
         X509 *cert = GenerateCertificate(hostname, p->ca, p->key);
-        SSL_CTX *client_ctx = SSL_CTX_new(TLS_server_method());
-        SSL_CTX_use_certificate(client_ctx, cert);
-        SSL_CTX_use_PrivateKey(client_ctx, p->key);
-        SSL *client_ssl = SSL_new(client_ctx);
-        SSL_set_fd(client_ssl, c->fd);
-        SSL_set_options(client_ssl, SSL_OP_IGNORE_UNEXPECTED_EOF);
-        SSL_set_mode(client_ssl, SSL_MODE_ASYNC | SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        client_ssl = CreateClientSSL(cert, p->key, c->fd);
+
+        DEBUG("SSL connection initialized for client\n");
 
         while (-1 == SSL_accept(client_ssl))
         {
             fd_set fds;
             FD_ZERO(&fds);
             FD_SET(c->fd, &fds);
+
             ERR_print_errors_fp(stdout);
 
             switch (SSL_get_error(client_ssl, -1))
@@ -208,7 +203,6 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
                     break;
                 default:
                     SSL_free(client_ssl);
-                    SSL_CTX_free(client_ctx);
                     X509_free(cert);
                     ssl_error(p, c);
                     return;
@@ -220,7 +214,6 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
 
         DEBUG("SSL connection initialized for client\n");
 
-        SSL_CTX_free(client_ctx);
         X509_free(cert);
     }
 }
@@ -275,13 +268,13 @@ static int process_message(Proxy p, connection c, char *buffer, int buffer_lengt
         }
     }
 
-// for (int i = 0; i <= buffer_length - 3; i++) {
-//     if (strncmp(&buffer[i], "the", 3) == 0) {
-//         buffer[i] = 'l';
-//         buffer[i + 1] = 'o';
-//         buffer[i + 2] = 'l';
-//     }
-// }
+    // for (int i = 0; i <= buffer_length - 3; i++) {
+    //     if (strncmp(&buffer[i], "the", 3) == 0) {
+    //         buffer[i] = 'l';
+    //         buffer[i + 1] = 'o';
+    //         buffer[i + 2] = 'l';
+    //     }
+    // }
 
     if (c->peer == NULL) {
         get_field(buffer, "Host: ", hostname_and_port, 256);
@@ -307,6 +300,7 @@ static int process_message(Proxy p, connection c, char *buffer, int buffer_lengt
         add_connection(p->cl, server);
 
         if (strcmp(method, "CONNECT") == 0){
+            DEBUG("CONNECT request\n");
             write_to_connection(c, CONNECT_response, strlen(CONNECT_response));
             init_SSL_connection(p, c, hostname);
         } else {
@@ -317,30 +311,30 @@ static int process_message(Proxy p, connection c, char *buffer, int buffer_lengt
     }
 }
 
-static int read_message(connection c, char *buffer, int buffer_size)
-{
-    int bytes_read = 0;
+// static int read_message(connection c, char *buffer, int buffer_size)
+// {
+//     int bytes_read = 0;
 
-    if (c->using_ssl) {
-        bytes_read = SSL_read(c->ssl, buffer, buffer_size);
-        if (bytes_read <= 0) {
-            int ssl_err = SSL_get_error(c->ssl, bytes_read);
-            if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-                return 0;
-            } else {
-                printf("Error reading from SSL connection\n");
-                return -1;
-            }
-        }
-        return bytes_read;
-    } else {
-        printf("c->fd: %d, c->using_ssl: %d\n", c->fd, c->using_ssl);
-        bytes_read = read(c->fd, buffer, buffer_size);
-        if (bytes_read <= 0) {
-            return -1;
-        }
-    }
-}
+//     if (c->using_ssl) {
+//         bytes_read = SSL_read(c->ssl, buffer, buffer_size);
+//         if (bytes_read <= 0) {
+//             int ssl_err = SSL_get_error(c->ssl, bytes_read);
+//             if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+//                 return 0;
+//             } else {
+//                 printf("Error reading from SSL connection\n");
+//                 return -1;
+//             }
+//         }
+//         return bytes_read;
+//     } else {
+//         printf("c->fd: %d, c->using_ssl: %d\n", c->fd, c->using_ssl);
+//         bytes_read = read(c->fd, buffer, buffer_size);
+//         if (bytes_read <= 0) {
+//             return -1;
+//         }
+//     }
+// }
 
 int proxy_run(Proxy p) 
 {
@@ -370,17 +364,17 @@ int proxy_run(Proxy p)
             
             if (FD_ISSET(sock, &fds)) {
                 DEBUG("Data available on socket %d\n", sock);
+
                 connection c = get_connection(p->cl, sock);
+
                 if (c == NULL) {
                     close(sock);
                     continue;
                 }
 
-                while(0 == (buffer_length = read_message(c, buffer, BUFFER_SIZE)))
-                    ;
+                buffer_length = read_from_connection(c, buffer, BUFFER_SIZE);
 
                 if (buffer_length < 0) {
-                    DEBUG("Connection closed %d\n", sock);
                     disconnect_connection(p, c);
                 } else {
                     process_message(p, c, buffer, buffer_length);

@@ -7,13 +7,31 @@
 
 #define INITIAL_SIZE 0xA00000
 
-static int expand_data(struct HTTPMessage *message)
+void init_message(struct HTTPMessage *message, int size)
 {
-    int new_length = message->length * 2 + 2;
-    char *new_data = realloc(message->data, new_length);
-    assert(new_data != NULL);
-    message->data = new_data;
-    return new_length;
+    message->data = calloc(size, 1);
+    assert(message->data != NULL);
+    message->size = size;
+    message->length = 0;
+}
+
+bool is_complete(struct HTTPMessage *message)
+{
+    char *header_end, *content_length_str;
+    int content_length, total_length;
+
+    header_end = strstr(message->data, "\r\n\r\n");
+    if (header_end == NULL)
+        return false;
+
+    content_length_str = strstr(message->data, "Content-Length: ");
+    if (content_length_str != NULL && content_length_str < header_end) {
+        content_length = atoi(content_length_str + strlen("Content-Length: "));
+        total_length = (header_end - message->data) + 4 + content_length;
+        return message->length >= total_length;
+    }
+
+    return true;
 }
 
 void clear_message(struct HTTPMessage *message)

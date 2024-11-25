@@ -16,8 +16,7 @@
 
 #include "connection_list.h"
 
-#define SSL_FRAME_SIZE 16384
-#define OVERFLOW_BUFFER_SIZE 0xFFFF
+#define MAX_HTTP_MESSAGE_SIZE 0xA00000
 
 struct connection_list {
     struct connection *connection;          // Head always NULL for connection
@@ -45,23 +44,18 @@ connection init_connection()
     c->peer = NULL;
     c->using_ssl = false;
     c->ssl = NULL;
-    c->overflow_buffer = malloc(OVERFLOW_BUFFER_SIZE);
-    c->overflow_length = 0;
-    c->message.data = NULL;
-    c->message.size = 0;
-    c->message.length = 0;
+    init_message(&c->message, 0xA00000);
 
     return c;
 }
 
 void connection_free(connection c)
 {
-    close(c->fd);
     if (c->using_ssl) {
         SSL_shutdown(c->ssl);
         SSL_free(c->ssl);
     }
-    free(c->overflow_buffer);
+    close(c->fd);
     clear_message(&c->message);
     free(c);
 }
@@ -148,30 +142,66 @@ int get_max_fd(connection_list cl)
     return max;
 }
 
-int read_from_connection(connection c, char *buffer, int length)
+
+// 0 means 0 bytes, -1 means error or closed
+int read_from_connection(connection c, char *buffer, int buffer_size)
 {
+    int bytes_read;
+    int err;
+
     if (c->using_ssl) {
-        int bytes_read = 0;
-        bytes_read = SSL_read(c->ssl, buffer, length);
-        if (bytes_read <= 0) {
-            printf("Error reading from SSL connection\n");
-            ERR_print_errors_fp(stdout);
+        while ((bytes_read = SSL_read(c->ssl, buffer, buffer_size)) <= 0) {
+            err = SSL_get_error(c->ssl, bytes_read);
+            if (err == SSL_ERROR_WANT_WRITE) {
+                fd_set fd;
+                FD_ZERO(&fd);
+                FD_SET(c->fd, &fd);
+                select(c->fd + 1, NULL, &fd, NULL, NULL);
+            } else if (err == SSL_ERROR_WANT_READ) {
+                return 0;
+            } else {
+                return -1;
+            }
         }
-        return bytes_read;
     } else {
-        return read(c->fd, buffer, length);
+        bytes_read = read(c->fd, buffer, buffer_size);
+        if (bytes_read <= 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;
+            } else {
+                return -1;
+            }
+        }
     }
+
+    return bytes_read;
 }
 
 int write_to_connection(connection c, char *buffer, int length)
 {
+    int bytes_written;
+
     if (c->using_ssl) {
-        int bytes_written = 0;
-        for (int i = 0; i < length; i += SSL_FRAME_SIZE)
-            bytes_written += SSL_write(c->ssl, buffer + i, length - i > SSL_FRAME_SIZE ? SSL_FRAME_SIZE : length - i);
-        return bytes_written;
+        while ((bytes_written = SSL_write(c->ssl, buffer, length)) <= 0) {
+            int err = SSL_get_error(c->ssl, bytes_written);
+            if (err == SSL_ERROR_WANT_WRITE) {
+                fd_set fd;
+                FD_ZERO(&fd);
+                FD_SET(c->fd, &fd);
+                select(c->fd + 1, NULL, &fd, NULL, NULL);
+            } else if (err == SSL_ERROR_WANT_READ) {
+                fd_set fd;
+                FD_ZERO(&fd);
+                FD_SET(c->fd, &fd);
+                select(c->fd + 1, &fd, NULL, NULL, NULL);
+            } else {
+                return -1;
+            }
+        }
     } else {
-        return write(c->fd, buffer, length);
+        bytes_written = write(c->fd, buffer, length);
     }
+
+    return bytes_written;
 }
 
