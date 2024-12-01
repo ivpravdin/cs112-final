@@ -25,6 +25,7 @@ struct connection {
     connection peer;                                 // The peer connection
     bool using_ssl;                                  // Whether the connection is using SSL
     SSL *ssl;                                        // SSL context for the connection
+    unsigned int flags;
     struct HTTPMessage message;                      // The HTTP message from the connection
 };
 

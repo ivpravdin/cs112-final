@@ -15,6 +15,12 @@ void init_message(struct HTTPMessage *message, int size)
     message->length = 0;
 }
 
+void free_message(struct HTTPMessage *message)
+{
+    free(message->data);
+    message->data = NULL;
+}
+
 bool is_complete(struct HTTPMessage *message)
 {
     char *header_end, *content_length_str;
@@ -36,10 +42,19 @@ bool is_complete(struct HTTPMessage *message)
 
 void clear_message(struct HTTPMessage *message)
 {
-    free(message->data);
-    message->data = NULL;
-    message->size = 0;
-    message->length = 0;
+    if (message != NULL) {
+        if (message->data != NULL) {
+            memset(message->data, 0, message->size);
+        }
+        message->length = 0;
+    }
+}
+
+void expand_data(struct HTTPMessage *message)
+{
+    message->size = message->size * 2 + 1;
+    message->data = realloc(message->data, message->size);
+    assert(message->data != NULL);
 }
 
 // return -1 if connection is closed

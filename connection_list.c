@@ -44,6 +44,7 @@ connection init_connection()
     c->peer = NULL;
     c->using_ssl = false;
     c->ssl = NULL;
+    c->flags = 0;
     init_message(&c->message, 0xA00000);
 
     return c;
@@ -56,7 +57,7 @@ void connection_free(connection c)
         SSL_free(c->ssl);
     }
     close(c->fd);
-    clear_message(&c->message);
+    free_message(&c->message);
     free(c);
 }
 
