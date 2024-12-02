@@ -284,11 +284,7 @@ int set_field(struct HTTPMessage *message, const char *field_name, const char *f
         if (shift != 0) {
             // Adjust buffer size if necessary
             if (message->length + shift >= message->size) {
-                message->size += shift + 1;
-                message->data = realloc(message->data, message->size);
-                if (!message->data) {
-                    return -1;
-                }
+                expand_data(message);
                 // Recalculate pointers after realloc
                 header_end = strstr(message->data, "\r\n\r\n");
                 field_start = strcasestr(message->data, field_name);
@@ -308,11 +304,7 @@ int set_field(struct HTTPMessage *message, const char *field_name, const char *f
     } else {
         // Field does not exist, add it before header end
         if (message->length + total_field_len >= message->size) {
-            message->size += total_field_len + 1;
-            message->data = realloc(message->data, message->size);
-            if (!message->data) {
-                return -1;
-            }
+            expand_data(message);
             // Recalculate header_end after realloc
             header_end = strstr(message->data, "\r\n\r\n");
             if (!header_end) {

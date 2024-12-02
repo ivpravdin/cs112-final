@@ -120,9 +120,50 @@
             isMinimized = !isMinimized;
         });
 
+        function minimizeContainer(Minimize) {
+            if (Minimize) {
+                container.style.height = '50px';
+                container.style.padding = '10px 20px';
+                label.style.display = 'block';
+                input.style.display = 'none';
+                button.style.display = 'none';
+                response.style.display = 'none';
+                toggleButton.innerText = '▲';
+                isMinimized = true;
+            } else {
+                container.style.height = 'auto';
+                container.style.padding = '20px';
+                label.style.display = 'block';
+                input.style.display = 'block';
+                button.style.display = 'block';
+                if (response.innerText.trim() !== '') {
+                    response.style.display = 'block';
+                }
+                toggleButton.innerText = '▼';
+                isMinimized = false;
+            }
+        }
+
+        let url = window.location.href;
+
         function checkAndToggleContainerVisibility() {
             const isTargetProductPage = /^https:\/\/www\.target\.com\/p\//.test(location.href);
             container.style.display = isTargetProductPage ? 'block' : 'none';
+            if (!isTargetProductPage) {
+                minimizeContainer(true);
+                input.value = '';
+                response.innerText = '';
+                response.style.display = 'none';
+                url = window.location.href;
+            } 
+            const currentTcinMatch = window.location.href.match(/\/A-(\d+)/);
+            const previousTcinMatch = url.match(/\/A-(\d+)/);
+            if (url !== window.location.href && currentTcinMatch && previousTcinMatch && currentTcinMatch[1] !== previousTcinMatch[1]) {
+                input.value = '';
+                response.innerText = '';
+                response.style.display = 'none';
+                url = window.location.href;
+            }
         }
 
         checkAndToggleContainerVisibility();
@@ -154,6 +195,7 @@
                 }
             }
             searchRecursive(obj);
+            if (results.size === 0) results.add(null);
             return Array.from(results);
         }
 
@@ -179,34 +221,36 @@
 
                 const pricingStoreId = getStoreIdFromCookie();
 
-                const ogUrlMeta = document.querySelector('meta[property="og:url"]');
-                if (!ogUrlMeta) {
-                    throw new Error("og:url meta tag not found.");
-                }
-                const tcinMatch = ogUrlMeta.content.match(/\/A-(\d+)$/);
-                const tcin = tcinMatch ? tcinMatch[1] : null;
-                if (!tcin) {
-                    throw new Error("TCIN not found in the og:url meta tag.");
-                }
+                const targetUrl = window.location.href;
+                const urlParams = new URLSearchParams(new URL(targetUrl).search);
+                const tcin = urlParams.has('preselect') ? urlParams.get('preselect') : targetUrl.match(/\/A-(\d+)/)[1];
 
                 const redskyUrl = `https://redsky.target.com/redsky_aggregations/v1/web/pdp_client_v1?key=${apiKey}&tcin=${tcin}&is_bot=true&pricing_store_id=${pricingStoreId}`;
                 const response = await fetch(redskyUrl);
                 if (!response.ok) {
                     throw new Error(`Failed to fetch product data: ${response.statusText}`);
                 }
+
                 const productData = await response.json();
 
-                console.log(productData);
+                let product = null;
+
+                if (productData?.data?.product?.children) {
+                    product = productData.data.product.children.find(child => child.tcin === tcin);
+                } else {
+                    product = productData.data.product;
+                }
 
                 return {
-                    title: productData?.data?.product?.item?.product_description?.title,
-                    description: productData?.data?.product?.item?.product_description?.downstream_description,
-                    specifications: productData?.data?.product?.item?.product_description?.bullet_descriptions,
-                    highlights: productData?.data?.product?.item?.product_description?.soft_bullets?.bullets,
-                    price: productData?.data?.product?.price,
+                    title: product?.item?.product_description?.title,
+                    description: product?.item?.product_description?.downstream_description,
+                    specifications: product?.item?.product_description?.bullet_descriptions,
+                    highlights: product?.item?.product_description?.soft_bullets,
+                    price: product?.price,
                     most_recent_ratings: productData?.data?.product?.ratings_and_reviews?.most_recent,
                     reviews_statistics: productData?.data?.product?.ratings_and_reviews?.statistics,
-                    drug_facts: productData?.data?.product?.item?.enrichment?.drug_facts,
+                    drug_facts: product?.item?.enrichment?.drug_facts,
+                    nutrition_facts: product?.item?.enrichment?.nutrition_facts,
                 }
             } catch (error) {
                 console.error("An error occurred:", error);
@@ -230,6 +274,8 @@
             };
 
             let productDescription = await getProductDescription();
+
+            console.log(productDescription);
 
             const productDescriptionMessages = Object.entries(productDescription).map(([key, value]) => ({
                 role: 'system',
