@@ -2,7 +2,7 @@ src = $(wildcard *.c)
 obj = $(src:.c=.o)
 CC = gcc
 CFLAGS = -g
-LDFLAGS = -lnsl -lssl -lcrypto
+LDFLAGS = -lnsl -lssl -lcrypto -lcurl
 
 a.out: $(obj)
 	$(CC) -o $@ $^ $(LDFLAGS)

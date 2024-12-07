@@ -10,16 +10,21 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <curl/curl.h>
 
 #include "proxy.h"
 #include "connection_list.h"
+#include "injection_script.h"
 #include "ssl_utils.h"
+#include "llm.h"
 
 #define DEBUG printf
 
 #define DEFAULT_PORT "80"
 #define DEFAULT_SSL_PORT "443"
 #define BUFFER_SIZE 0xA00000
+
+#define PROXY_URL "llmproxy.com"
 
 #define TARGET_FLAG 0x1
 
@@ -153,34 +158,37 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
     DEBUG("Initializing SSL connection\n");
     printf("C-role: %d\n", c->role);
     if (c->role == 0) {
-        server_ssl = CreateServerSSL(hostname, c->peer->fd);
 
-        while (-1 == SSL_connect(server_ssl))
-        {
-            fd_set fds;
-            FD_ZERO(&fds);
-            FD_SET(c->peer->fd, &fds);
+        if(c->peer != NULL) {
+            server_ssl = CreateServerSSL(hostname, c->peer->fd);
 
-            ERR_print_errors_fp(stdout);
-            printf("SSL_error: %d\n", SSL_get_error(server_ssl, -1));
-
-            switch (SSL_get_error(server_ssl, -1))
+            while (-1 == SSL_connect(server_ssl))
             {
-                case SSL_ERROR_WANT_READ:
-                    select(c->peer->fd + 1, &fds, NULL, NULL, NULL);
-                    break;
-                case SSL_ERROR_WANT_WRITE:
-                    select(c->peer->fd + 1, NULL, &fds, NULL, NULL);
-                    break;
-                default:
-                    SSL_free(server_ssl);
-                    ssl_error(p, c);
-                    return;
-            }
-        }
+                fd_set fds;
+                FD_ZERO(&fds);
+                FD_SET(c->peer->fd, &fds);
 
-        c->peer->ssl = server_ssl;
-        c->peer->using_ssl = 1;
+                ERR_print_errors_fp(stdout);
+                printf("SSL_error: %d\n", SSL_get_error(server_ssl, -1));
+
+                switch (SSL_get_error(server_ssl, -1))
+                {
+                    case SSL_ERROR_WANT_READ:
+                        select(c->peer->fd + 1, &fds, NULL, NULL, NULL);
+                        break;
+                    case SSL_ERROR_WANT_WRITE:
+                        select(c->peer->fd + 1, NULL, &fds, NULL, NULL);
+                        break;
+                    default:
+                        SSL_free(server_ssl);
+                        ssl_error(p, c);
+                        return;
+                }
+            }
+
+            c->peer->ssl = server_ssl;
+            c->peer->using_ssl = 1;
+        }
 
         X509 *cert = GenerateCertificate(hostname, p->ca, p->key);
         client_ssl = CreateClientSSL(cert, p->key, c->fd);
@@ -220,144 +228,24 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
     }
 }
 
-static int get_method(char *message, char *method, int max_length)
-{
-    char *end = strstr(message, " ");
-    if (end == NULL) {
-        return -1;
-    }
-
-    int length = end - message > max_length - 1 ? max_length - 1 : end - message;
-    strncpy(method, message, length);
-    method[length] = '\0';
-    return length;
-}
-
-int get_field(char *message, const char *field_name, char *field_value, int max_length)
-{
-    char *field = strcasestr(message, field_name);
-    if (field == NULL) {
-        return -1;
-    }
-
-    field += strlen(field_name);
-    char *end = strcasestr(field, "\r\n");
-    if (end == NULL) {
-        return -1;
-    }
-
-    int length = end - field > max_length - 1 ? max_length - 1 : end - field;
-    strncpy(field_value, field, length);
-    field_value[length] = '\0';
-    return length;
-}
-
-int set_field(struct HTTPMessage *message, const char *field_name, const char *field_value)
-{
-    char *header_end = strstr(message->data, "\r\n\r\n");
-    if (!header_end) {
-        // Invalid HTTP message
-        return -1;
-    }
-
-    int field_name_len = strlen(field_name);
-    int field_value_len = strlen(field_value);
-    int total_field_len = field_name_len + field_value_len + 4; // "Field: Value\r\n"
-
-    char *field_start = strcasestr(message->data, field_name);
-    if (field_start && field_start < header_end) {
-        // Field exists, replace its value
-        char *value_start = strstr(field_start, ":");
-        if (!value_start || value_start > header_end) {
-            return -1;
-        }
-        value_start += 1;
-        while (*value_start == ' ') {
-            value_start++;
-        }
-        char *value_end = strstr(value_start, "\r\n");
-        if (!value_end || value_end > header_end) {
-            return -1;
-        }
-        int old_value_len = value_end - value_start;
-        int shift = field_value_len - old_value_len;
-        if (shift != 0) {
-            // Adjust buffer size if necessary
-            if (message->length + shift >= message->size) {
-                expand_data(message);
-                // Recalculate pointers after realloc
-                header_end = strstr(message->data, "\r\n\r\n");
-                field_start = strcasestr(message->data, field_name);
-                value_start = strstr(field_start, ":") + 1;
-                while (*value_start == ' ') {
-                    value_start++;
-                }
-                value_end = value_start + old_value_len;
-            }
-            memmove(value_end + shift, value_end, message->length - (value_end - message->data));
-            memcpy(value_start, field_value, field_value_len);
-            message->length += shift;
-            message->data[message->length] = '\0';
-        } else {
-            memcpy(value_start, field_value, field_value_len);
-        }
-    } else {
-        // Field does not exist, add it before header end
-        if (message->length + total_field_len >= message->size) {
-            expand_data(message);
-            // Recalculate header_end after realloc
-            header_end = strstr(message->data, "\r\n\r\n");
-            if (!header_end) {
-                return -1;
-            }
-        }
-        memmove(header_end + total_field_len, header_end, message->length - (header_end - message->data));
-        memcpy(header_end, field_name, field_name_len);
-        header_end += field_name_len;
-        memcpy(header_end, ": ", 2);
-        header_end += 2;
-        memcpy(header_end, field_value, field_value_len);
-        header_end += field_value_len;
-        memcpy(header_end, "\r\n", 2);
-        message->length += total_field_len;
-        message->data[message->length] = '\0';
-    }
-    return 0;
-}
-
 static int process_target_product_page(struct HTTPMessage *message)
 {
-    char injected_script[30000];
-    FILE *file = fopen("injection_script.html", "r");
-    if (file) {
-        size_t new_len = fread(injected_script, sizeof(char), BUFFER_SIZE, file);
-        if (ferror(file) != 0) {
-            fputs("Error reading file", stderr);
-        } else {
-            injected_script[new_len++] = '\0';
-        }
-        fclose(file);
-    } else {
-        fputs("Error opening file", stderr);
-    }
+    extern const char *injection_script;
 
     char *html_end = strcasestr(message->data, "</html>");
     if (html_end != NULL) {
-        int script_length = strlen(injected_script);
+        int script_length = strlen(injection_script);
         int new_length = message->length + script_length;
 
-        // Expand the message if there is not enough space
         if (new_length > message->size) {
             expand_data(message);
         }
 
-        // Insert the injected script before </html>
         memmove(html_end + script_length, html_end, message->length - (html_end - message->data));
-        memcpy(html_end, injected_script, script_length);
+        memcpy(html_end, injection_script, script_length);
         message->length = new_length;
         message->data[message->length] = '\0';
 
-        // Update the Content-Length header
         char *header_end = strstr(message->data, "\r\n\r\n");
         if (header_end) {
             int body_length = message->length - (header_end - message->data) - 4;
@@ -370,6 +258,50 @@ static int process_target_product_page(struct HTTPMessage *message)
     return 0;
 }
 
+static int process_LLM_request(Proxy p, connection c, char *method)
+{
+    int request_length, response_length;
+    char *request = malloc(BUFFER_SIZE);
+    char *request_start;
+    char buffer[1024];
+    char response_header[1024];
+    char *response = malloc(BUFFER_SIZE);
+
+    if (strcmp(method, "CONNECT") == 0) {
+        strncpy(response, "HTTP/1.1 200 OK\r\n\r\n", 22);
+        write_to_connection(c, response, strlen(response));
+        init_SSL_connection(p, c, PROXY_URL);
+    } else if (strcmp(method, "OPTIONS") == 0) {
+        response_length = get_OPTIONS_response(response);
+        write_to_connection(c, response, strlen(response));
+    } else if (strcmp(method, "POST") == 0) {
+        get_field(c->message.data, "Content-Length: ", buffer, 1024);
+        request_length = atoi(buffer);
+
+        request_start = strstr(c->message.data, "\r\n\r\n") + 4;
+        strncpy(request, request_start, request_length);
+
+        process_POST_request(request, response);
+        
+        snprintf(response_header, sizeof(response_header),
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %zu\r\n"
+             "Access-Control-Allow-Origin: https://www.target.com\r\n"
+             "Access-Control-Allow-Methods: POST, OPTIONS\r\n"
+             "Access-Control-Allow-Headers: x-api-key, Content-Type\r\n"
+             "Access-Control-Max-Age: 86400\r\n"
+             "Vary: Origin\r\n"
+             "\r\n", strlen(response));
+
+        write_to_connection(c, response_header, strlen(response_header));
+        write_to_connection(c, response, strlen(response));
+    }
+
+    free(request);
+    free(response);
+}
+
 static int process_message(Proxy p, connection c)
 {
     char method[16];
@@ -377,6 +309,7 @@ static int process_message(Proxy p, connection c)
     char hostname[256];
     char port[16] = {0};
     char CONNECT_response[] = "HTTP/1.1 200 OK\r\n\r\n";
+    char buffer[256] = {0};
     get_method(c->message.data, method, 16);
 
     char *accept_encoding = strcasestr(c->message.data, "Accept-Encoding:");
@@ -395,6 +328,11 @@ static int process_message(Proxy p, connection c)
     if (c->role == 1 && (c->peer->flags & TARGET_FLAG)) {
         process_target_product_page(&c->message);
         c->peer->flags &= ~TARGET_FLAG;
+    }
+
+    if (c->role == 0 && (strstr(c->message.data, "Host: llmproxy.com") != NULL)) {
+        process_LLM_request(p, c, method);
+        return 0;
     }
 
     if (c->peer == NULL) {
@@ -431,31 +369,6 @@ static int process_message(Proxy p, connection c)
         write_to_connection(c->peer, c->message.data, c->message.length);
     }
 }
-
-// static int read_message(connection c, char *buffer, int buffer_size)
-// {
-//     int bytes_read = 0;
-
-//     if (c->using_ssl) {
-//         bytes_read = SSL_read(c->ssl, buffer, buffer_size);
-//         if (bytes_read <= 0) {
-//             int ssl_err = SSL_get_error(c->ssl, bytes_read);
-//             if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
-//                 return 0;
-//             } else {
-//                 printf("Error reading from SSL connection\n");
-//                 return -1;
-//             }
-//         }
-//         return bytes_read;
-//     } else {
-//         printf("c->fd: %d, c->using_ssl: %d\n", c->fd, c->using_ssl);
-//         bytes_read = read(c->fd, buffer, buffer_size);
-//         if (bytes_read <= 0) {
-//             return -1;
-//         }
-//     }
-// }
 
 int proxy_run(Proxy p) 
 {
@@ -504,12 +417,16 @@ int proxy_run(Proxy p)
 
                 c->message.length += bytes_read;
 
-
                 if (c->message.length == c->message.size) {
                     expand_data(&c->message);
                 }
 
-                if (is_complete(&c->message)) {
+                if ((c->peer != NULL) && (c->peer->flags & TARGET_FLAG)) {
+                    if (is_complete(&c->message)) {
+                        process_message(p, c);
+                        clear_message(&c->message);
+                    }
+                } else {
                     process_message(p, c);
                     clear_message(&c->message);
                 }

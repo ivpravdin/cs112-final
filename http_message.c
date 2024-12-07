@@ -57,105 +57,101 @@ void expand_data(struct HTTPMessage *message)
     assert(message->data != NULL);
 }
 
-// return -1 if connection is closed
-// return 0 if message is incomplete
-// return 1 if message is complete
-// int read_message(struct HTTPMessage *message, char *overflow_buffer, int *overflow_length, int (*read_from_connection)(void *, char *, int), void *conn)
-// {
-//     int read_bytes;
-//     char buffer[256];
+int get_method(char *message, char *method, int max_length)
+{
+    char *end = strstr(message, " ");
+    if (end == NULL) {
+        return -1;
+    }
 
-//     if (message->data == NULL) {
-//         message->size = INITIAL_SIZE;
-//         message->data = calloc(message->size, 1);
-//         assert(message->data != NULL);
-//     }
+    int length = end - message > max_length - 1 ? max_length - 1 : end - message;
+    strncpy(method, message, length);
+    method[length] = '\0';
+    return length;
+}
 
-//     if (*overflow_length > 0) {
-//         if (message->length + *overflow_length > message->size) {
-//             message->size = expand_data(message);
-//         }
-//         memcpy(&message->data[message->length], overflow_buffer, *overflow_length);
-//         message->length += *overflow_length;
-//         *overflow_length = 0;
-//     }
+int get_field(char *message, const char *field_name, char *field_value, int max_length)
+{
+    char *field = strcasestr(message, field_name);
+    if (field == NULL) {
+        return -1;
+    }
 
-//     read_bytes = read_from_connection(conn, &message->data[message->length], message->size - message->length);
+    field += strlen(field_name);
+    char *end = strcasestr(field, "\r\n");
+    if (end == NULL) {
+        return -1;
+    }
 
-//     printf("Read %d bytes\n", read_bytes); // Debugging
+    int length = end - field > max_length - 1 ? max_length - 1 : end - field;
+    strncpy(field_value, field, length);
+    field_value[length] = '\0';
+    return length;
+}
 
-//     if (read_bytes <= 0) {
-//         return -1;
-//     }
+int set_field(struct HTTPMessage *message, const char *field_name, const char *field_value)
+{
+    char *header_end = strstr(message->data, "\r\n\r\n");
+    if (!header_end) {
+        return -1;
+    }
 
-//     message->length += read_bytes;
+    int field_name_len = strlen(field_name);
+    int field_value_len = strlen(field_value);
+    int total_field_len = field_name_len + field_value_len + 4;
 
-//     // if (strstr(message->data, "\r\n\r\n") != NULL) {
-//     //     if (get_field(message, "Content-Length: ", buffer) > 0) {
-//     //         int content_length = atoi(buffer);  
-//     //         char *header_end = strstr(message->data, "\r\n\r\n");
-//     //         int header_length = (header_end - message->data) + 4;
-//     //         int total_length = header_length + content_length;
-
-//     //         if (message->length > total_length) {
-//     //             int extra_bytes = message->length - total_length;
-//     //             memcpy(overflow_buffer, &message->data[total_length], extra_bytes);
-//     //             *overflow_length = extra_bytes;
-//     //             message->length = total_length;
-//     //         }
-
-//     //         if (message->length == total_length)
-//     //             return 1;
-//     //     } else {
-//     //         char *header_end = strstr(message->data, "\r\n\r\n");
-//     //         int header_length = header_end - message->data + 4;
-//     //         if (message->length > header_length) {
-//     //             int extra_bytes = message->length - header_length;
-//     //             memcpy(overflow_buffer, message->data + header_length, extra_bytes);
-//     //             *overflow_length = extra_bytes;
-//     //             message->length = header_length;
-//     //         }
-//     //         return 1;
-//     //     }
-//     // }
-
-//     // if (message->length == message->size) {
-//     //     message->size = expand_data(message);
-//     //     printf("Expanded data to %d\n", message->size); // Debugging
-//     // }
-
-//     return 1;
-// }
-
-// int get_method(struct HTTPMessage *message, char *method)
-// {
-//     char *end = strstr(message->data, " ");
-//     if (end == NULL) {
-//         return -1;
-//     }
-
-//     int length = end - message->data;
-//     strncpy(method, message->data, length);
-//     method[length] = '\0';
-//     return length;
-// }
-
-// int get_field(struct HTTPMessage *message, const char *field_name, char *field_value)
-// {
-//     assert(message != NULL && message->data != NULL);
-//     char *field = strcasestr(message->data, field_name);
-//     if (field == NULL) {
-//         return -1;
-//     }
-
-//     field += strlen(field_name);
-//     char *end = strcasestr(field, "\r\n");
-//     if (end == NULL) {
-//         return -1;
-//     }
-
-//     int length = end - field;
-//     strncpy(field_value, field, length);
-//     field_value[length] = '\0';
-//     return length;
-// }
+    char *field_start = strcasestr(message->data, field_name);
+    if (field_start && field_start < header_end) {
+        char *value_start = strstr(field_start, ":");
+        if (!value_start || value_start > header_end) {
+            return -1;
+        }
+        value_start += 1;
+        while (*value_start == ' ') {
+            value_start++;
+        }
+        char *value_end = strstr(value_start, "\r\n");
+        if (!value_end || value_end > header_end) {
+            return -1;
+        }
+        int old_value_len = value_end - value_start;
+        int shift = field_value_len - old_value_len;
+        if (shift != 0) {
+            if (message->length + shift >= message->size) {
+                expand_data(message);
+                header_end = strstr(message->data, "\r\n\r\n");
+                field_start = strcasestr(message->data, field_name);
+                value_start = strstr(field_start, ":") + 1;
+                while (*value_start == ' ') {
+                    value_start++;
+                }
+                value_end = value_start + old_value_len;
+            }
+            memmove(value_end + shift, value_end, message->length - (value_end - message->data));
+            memcpy(value_start, field_value, field_value_len);
+            message->length += shift;
+            message->data[message->length] = '\0';
+        } else {
+            memcpy(value_start, field_value, field_value_len);
+        }
+    } else {
+        if (message->length + total_field_len >= message->size) {
+            expand_data(message);
+            header_end = strstr(message->data, "\r\n\r\n");
+            if (!header_end) {
+                return -1;
+            }
+        }
+        memmove(header_end + total_field_len, header_end, message->length - (header_end - message->data));
+        memcpy(header_end, field_name, field_name_len);
+        header_end += field_name_len;
+        memcpy(header_end, ": ", 2);
+        header_end += 2;
+        memcpy(header_end, field_value, field_value_len);
+        header_end += field_value_len;
+        memcpy(header_end, "\r\n", 2);
+        message->length += total_field_len;
+        message->data[message->length] = '\0';
+    }
+    return 0;
+}
