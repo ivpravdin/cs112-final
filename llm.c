@@ -46,16 +46,8 @@ void process_POST_request(char *request, char* response)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
 
-    FILE *debug_file = fopen("request_debug.log", "w");
-    if (debug_file) {
-        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-        curl_easy_setopt(curl, CURLOPT_STDERR, debug_file);
-    }
-
     curl_easy_perform(curl);
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl); 
-
-    fclose(debug_file);
 }

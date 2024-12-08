@@ -193,7 +193,7 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
         X509 *cert = GenerateCertificate(hostname, p->ca, p->key);
         client_ssl = CreateClientSSL(cert, p->key, c->fd);
 
-        DEBUG("SSL connection initialized for client\n");
+        DEBUG("SSL connection initialized for server\n");
 
         while (-1 == SSL_accept(client_ssl))
         {
