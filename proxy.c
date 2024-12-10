@@ -22,7 +22,7 @@
 
 #define DEFAULT_PORT "80"
 #define DEFAULT_SSL_PORT "443"
-#define BUFFER_SIZE 0xA00000
+#define BUFFER_SIZE 0x1FFFFFF
 
 #define PROXY_URL "llmproxy.com"
 
@@ -156,7 +156,6 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
         return;
 
     DEBUG("Initializing SSL connection\n");
-    printf("C-role: %d\n", c->role);
     if (c->role == 0) {
 
         if(c->peer != NULL) {
@@ -169,7 +168,7 @@ static void init_SSL_connection(Proxy p, connection c, char *hostname)
                 FD_SET(c->peer->fd, &fds);
 
                 ERR_print_errors_fp(stdout);
-                printf("SSL_error: %d\n", SSL_get_error(server_ssl, -1));
+                DEBUG("SSL_error: %d\n", SSL_get_error(server_ssl, -1));
 
                 switch (SSL_get_error(server_ssl, -1))
                 {
@@ -312,17 +311,18 @@ static int process_message(Proxy p, connection c)
     char buffer[256] = {0};
     get_method(c->message.data, method, 16);
 
-    char *accept_encoding = strcasestr(c->message.data, "Accept-Encoding:");
-    if (c->role == 0 && accept_encoding != NULL) {
-        char *end = strstr(accept_encoding, "\r\n");
-        if (end != NULL) {
-            memmove(accept_encoding, end + 2, c->message.length - (end + 2 - c->message.data));
-            c->message.length -= (end + 2 - accept_encoding);
+    if (strncmp(method, "GET", 3) == 0) {
+        char *accept_encoding = strcasestr(c->message.data, "Accept-Encoding:");
+        if (c->role == 0 && accept_encoding != NULL) {
+            char *end = strstr(accept_encoding, "\r\n");
+            if (end != NULL) {
+                memmove(accept_encoding, end + 2, c->message.length - (end + 2 - c->message.data));
+                c->message.length -= (end + 2 - accept_encoding);
+            }
         }
-    }
 
-    if ((strncmp(method, "GET", 3) == 0) && (strstr(c->message.data, "Host: target.com") || strstr(c->message.data, "Host: www.target.com"))) {
-        c->flags |= TARGET_FLAG;
+        if (strstr(c->message.data, "Host: target.com") || strstr(c->message.data, "Host: www.target.com"))
+            c->flags |= TARGET_FLAG;
     }
 
     if (c->role == 1 && (c->peer->flags & TARGET_FLAG)) {

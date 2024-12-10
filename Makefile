@@ -1,7 +1,7 @@
 src = $(wildcard *.c)
 obj = $(src:.c=.o)
 CC = gcc
-CFLAGS = -g -O2
+CFLAGS = -O1
 LDFLAGS = -lnsl -lssl -lcrypto -lcurl
 
 a.out: $(obj)

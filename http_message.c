@@ -43,9 +43,6 @@ bool is_complete(struct HTTPMessage *message)
 void clear_message(struct HTTPMessage *message)
 {
     if (message != NULL) {
-        if (message->data != NULL) {
-            memset(message->data, 0, message->size);
-        }
         message->length = 0;
     }
 }
